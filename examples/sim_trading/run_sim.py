@@ -8,9 +8,11 @@ import sys
 from time import sleep
 from datetime import datetime, time
 
-from vnpy.event import EventEngine
+from vnpy.event import Event, EventEngine
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.engine import MainEngine, LogEngine
+from vnpy.trader.object import TickData, ContractData
+from vnpy.trader.event import EVENT_TICK, EVENT_CONTRACT, EVENT_LOG
 from vnpy.trader.logger import INFO, logger
 
 from vnpy_ctp import CtpGateway
@@ -120,17 +122,56 @@ def run() -> None:
     event_engine.register(EVENT_CTA_LOG, log_engine.process_log_event)
     logger.info("日志事件监听注册完成")
 
-    # 5. 连接 SimNow CTP 仿真服务器
+    # 5. 连接诊断：监控 Tick 接收情况
+    tick_counter = {"count": 0, "last_tick_time": None, "last_tick_symbol": None}
+
+    def on_tick_diagnostic(event: Event) -> None:
+        tick: TickData = event.data
+        tick_counter["count"] += 1
+        tick_counter["last_tick_time"] = tick.datetime
+        tick_counter["last_tick_symbol"] = tick.vt_symbol
+        # 前 5 个 Tick 打印详情，之后每 100 个打印一次
+        if tick_counter["count"] <= 5 or tick_counter["count"] % 100 == 0:
+            logger.info(
+                f"[Tick诊断] 第{tick_counter['count']}个 | {tick.vt_symbol} | "
+                f"最新价={tick.last_price} | 时间={tick.datetime}"
+            )
+
+    # 注册通用 Tick 事件（不带合约后缀，接收所有合约的 Tick）
+    event_engine.register(EVENT_TICK + STRATEGY_CONFIG["vt_symbol"], on_tick_diagnostic)
+
+    # 6. 连接 SimNow CTP 仿真服务器
     main_engine.connect(CTP_SETTING, "CTP")
     logger.info("正在连接 SimNow CTP 仿真服务器...")
-    logger.info("等待连接建立和合约数据下载（约 20 秒）...")
-    sleep(20)
+    logger.info("等待连接建立和合约数据下载（约 25 秒）...")
+    sleep(25)
 
-    # 6. 初始化 CTA 策略引擎
+    # 7. 连接诊断：检查合约信息
+    vt_symbol = STRATEGY_CONFIG["vt_symbol"]
+    contract = main_engine.get_contract(vt_symbol)
+    if contract:
+        logger.info(f"[诊断] 合约信息获取成功: {contract.name} ({vt_symbol})")
+    else:
+        logger.warning(f"[诊断] 未获取到合约 {vt_symbol} 的信息！")
+        logger.warning("[诊断] 可能原因: 1) 合约代码不正确 2) 连接未成功 3) 合约数据未下载完")
+        # 列出已获取的部分合约，帮助用户确认连接状态
+        all_contracts = main_engine.get_all_contracts()
+        if all_contracts:
+            rb_contracts = [c for c in all_contracts if c.symbol.startswith("rb")]
+            if rb_contracts:
+                logger.info(f"[诊断] 可用的螺纹钢合约: {[c.vt_symbol for c in rb_contracts[:5]]}")
+            else:
+                sample = [c.vt_symbol for c in all_contracts[:10]]
+                logger.info(f"[诊断] 已获取 {len(all_contracts)} 个合约，示例: {sample}")
+        else:
+            logger.error("[诊断] 未获取到任何合约信息，CTP 连接可能失败！")
+            logger.error("[诊断] 请检查: 1) 账号密码是否正确 2) 网络是否可达 3) SimNow 是否在维护")
+
+    # 8. 初始化 CTA 策略引擎
     cta_engine.init_engine()
     logger.info("CTA 策略引擎初始化完成")
 
-    # 7. 添加策略实例
+    # 9. 添加策略实例
     cta_engine.add_strategy(
         class_name=STRATEGY_CONFIG["class_name"],
         strategy_name=STRATEGY_CONFIG["strategy_name"],
@@ -139,12 +180,12 @@ def run() -> None:
     )
     logger.info(f"策略 [{STRATEGY_CONFIG['strategy_name']}] 添加成功")
 
-    # 8. 初始化策略（加载历史数据）
+    # 10. 初始化策略（加载历史数据）
     cta_engine.init_strategy(STRATEGY_CONFIG["strategy_name"])
     sleep(10)   # 等待策略初始化完成
     logger.info(f"策略 [{STRATEGY_CONFIG['strategy_name']}] 初始化完成")
 
-    # 9. 启动策略
+    # 11. 启动策略
     cta_engine.start_strategy(STRATEGY_CONFIG["strategy_name"])
     logger.info(f"策略 [{STRATEGY_CONFIG['strategy_name']}] 已启动运行！")
 
@@ -152,7 +193,7 @@ def run() -> None:
     logger.info("模拟交易运行中，按 Ctrl+C 停止...")
     logger.info("=" * 60)
 
-    # 10. 主循环：保持运行，监控状态
+    # 12. 主循环：保持运行，监控状态
     try:
         while True:
             sleep(10)
@@ -161,15 +202,26 @@ def run() -> None:
             if not strategy:
                 continue
 
+            # 诊断：Tick 接收情况
+            total_ticks = tick_counter["count"]
+
             # 检查 ArrayManager 预热状态
             if hasattr(strategy, "am") and not strategy.am.inited:
                 bar_count = strategy.am.count
                 bar_needed = strategy.am.size
-                logger.info(
-                    f"[预热中] ArrayManager 积累进度: {bar_count}/{bar_needed} 根K线 "
-                    f"({bar_count * 100 // bar_needed}%) — "
-                    f"需要约 {(bar_needed - bar_count)} 根1分钟K线后开始交易"
-                )
+
+                if total_ticks == 0:
+                    logger.warning(
+                        f"[诊断] 尚未收到任何 Tick 数据！"
+                        f"可能原因: 1) 当前非交易时段 2) 合约代码不正确 3) 连接失败"
+                    )
+                else:
+                    logger.info(
+                        f"[预热中] K线进度: {bar_count}/{bar_needed} "
+                        f"({bar_count * 100 // bar_needed}%) | "
+                        f"已收到 {total_ticks} 个Tick | "
+                        f"还需约 {bar_needed - bar_count} 根K线"
+                    )
                 continue
 
             # ArrayManager 已就绪，显示策略运行状态
@@ -177,7 +229,8 @@ def run() -> None:
             logger.info(
                 f"[运行中] 持仓={variables.get('pos', 0)}, "
                 f"fast_ma={variables.get('fast_ma0', 0):.2f}, "
-                f"slow_ma={variables.get('slow_ma0', 0):.2f}"
+                f"slow_ma={variables.get('slow_ma0', 0):.2f} | "
+                f"累计Tick={total_ticks}"
             )
 
     except KeyboardInterrupt:
