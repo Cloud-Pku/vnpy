@@ -157,15 +157,28 @@ def run() -> None:
         while True:
             sleep(10)
 
-            # 获取策略状态并打印
             strategy = cta_engine.strategies.get(STRATEGY_CONFIG["strategy_name"])
-            if strategy:
-                variables = strategy.get_variables()
+            if not strategy:
+                continue
+
+            # 检查 ArrayManager 预热状态
+            if hasattr(strategy, "am") and not strategy.am.inited:
+                bar_count = strategy.am.count
+                bar_needed = strategy.am.size
                 logger.info(
-                    f"[策略状态] 持仓={variables.get('pos', 0)}, "
-                    f"fast_ma={variables.get('fast_ma0', 0):.2f}, "
-                    f"slow_ma={variables.get('slow_ma0', 0):.2f}"
+                    f"[预热中] ArrayManager 积累进度: {bar_count}/{bar_needed} 根K线 "
+                    f"({bar_count * 100 // bar_needed}%) — "
+                    f"需要约 {(bar_needed - bar_count)} 根1分钟K线后开始交易"
                 )
+                continue
+
+            # ArrayManager 已就绪，显示策略运行状态
+            variables = strategy.get_variables()
+            logger.info(
+                f"[运行中] 持仓={variables.get('pos', 0)}, "
+                f"fast_ma={variables.get('fast_ma0', 0):.2f}, "
+                f"slow_ma={variables.get('slow_ma0', 0):.2f}"
+            )
 
     except KeyboardInterrupt:
         logger.info("收到停止信号，正在关闭...")
