@@ -4,6 +4,8 @@ SimNow 仿真交易启动脚本（No-UI 模式）
 - 使用双均线策略（DoubleMaStrategy）交易螺纹钢
 - 纯命令行运行，无需 GUI
 """
+import argparse
+import os
 import sys
 from time import sleep
 from datetime import datetime, time
@@ -11,8 +13,8 @@ from datetime import datetime, time
 from vnpy.event import Event, EventEngine
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.engine import MainEngine, LogEngine
-from vnpy.trader.object import TickData, ContractData
-from vnpy.trader.event import EVENT_TICK, EVENT_CONTRACT, EVENT_LOG
+from vnpy.trader.object import TickData
+from vnpy.trader.event import EVENT_TICK
 from vnpy.trader.logger import INFO, logger
 
 from vnpy_ctp import CtpGateway
@@ -34,14 +36,17 @@ SETTINGS["log.file"] = True
 # 注册地址：https://www.simnow.com.cn/
 # ============================================================
 CTP_SETTING = {
-    "用户名": "",           # SimNow 账号（手机号）
-    "密码": "",             # SimNow 密码
+    # SimNow 登录用户名应填写 6 位 InvestorID，不是网页登录手机号。
+    # 可通过环境变量 SIMNOW_USER/SIMNOW_PASSWORD 覆盖，避免把密码写在脚本里。
+    "用户名": os.getenv("SIMNOW_USER", "18811412241"),
+    "密码": os.getenv("SIMNOW_PASSWORD", "!CzhCy1124"),
     "经纪商代码": "9999",
-    "交易服务器": "180.168.146.187:10202",   # 第二套（7x24h 可用）
-    "行情服务器": "180.168.146.187:10212",   # 第二套（7x24h 可用）
+    # SimNow CTP 仿真前置。可通过环境变量切换其他前置地址。
+    "交易服务器": os.getenv("SIMNOW_TD_ADDRESS", "182.254.243.31:40001"),
+    "行情服务器": os.getenv("SIMNOW_MD_ADDRESS", "182.254.243.31:40011"),
     "产品名称": "simnow_client_test",
     "授权编码": "0000000000000000",
-    "柜台环境": "测试",     # SimNow 为测试环境
+    "柜台环境": os.getenv("SIMNOW_ENVIRONMENT", "实盘"),
 }
 
 # ============================================================
@@ -90,7 +95,7 @@ def validate_config() -> bool:
     return True
 
 
-def run() -> None:
+def run(check_connection: bool = False, wait_seconds: int = 25) -> None:
     """启动模拟交易"""
     # 校验配置
     if not validate_config():
@@ -143,8 +148,8 @@ def run() -> None:
     # 6. 连接 SimNow CTP 仿真服务器
     main_engine.connect(CTP_SETTING, "CTP")
     logger.info("正在连接 SimNow CTP 仿真服务器...")
-    logger.info("等待连接建立和合约数据下载（约 25 秒）...")
-    sleep(25)
+    logger.info(f"等待连接建立和合约数据下载（约 {wait_seconds} 秒）...")
+    sleep(wait_seconds)
 
     # 7. 连接诊断：检查合约信息
     vt_symbol = STRATEGY_CONFIG["vt_symbol"]
@@ -165,7 +170,12 @@ def run() -> None:
                 logger.info(f"[诊断] 已获取 {len(all_contracts)} 个合约，示例: {sample}")
         else:
             logger.error("[诊断] 未获取到任何合约信息，CTP 连接可能失败！")
-            logger.error("[诊断] 请检查: 1) 账号密码是否正确 2) 网络是否可达 3) SimNow 是否在维护")
+            logger.error("[诊断] 请检查: 1) 用户名是否为 6 位 InvestorID 2) 账号密码是否正确 3) 网络是否可达 4) SimNow 是否在维护")
+
+    if check_connection:
+        logger.info("连接检查模式结束，不启动 CTA 策略。")
+        main_engine.close()
+        return
 
     # 8. 初始化 CTA 策略引擎
     cta_engine.init_engine()
@@ -241,5 +251,23 @@ def run() -> None:
     logger.info("模拟交易系统已安全关闭")
 
 
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="SimNow CTP 仿真交易启动脚本")
+    parser.add_argument(
+        "--check-connection",
+        action="store_true",
+        help="只检查 CTP 连接和合约下载，不启动 CTA 策略",
+    )
+    parser.add_argument(
+        "--wait",
+        type=int,
+        default=25,
+        help="连接后等待合约下载的秒数，默认 25",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    run()
+    args = parse_args()
+    run(check_connection=args.check_connection, wait_seconds=args.wait)
