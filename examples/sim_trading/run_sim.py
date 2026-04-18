@@ -13,9 +13,11 @@ from datetime import datetime, time
 from vnpy.event import Event, EventEngine
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.engine import MainEngine, LogEngine
-from vnpy.trader.object import TickData
+from vnpy.trader.object import BarData, TickData
 from vnpy.trader.event import EVENT_TICK
+from vnpy.trader.database import BaseDatabase, get_database
 from vnpy.trader.logger import INFO, logger
+from vnpy.trader.utility import BarGenerator
 
 from vnpy_ctp import CtpGateway
 from vnpy_ctastrategy import CtaStrategyApp, CtaEngine
@@ -38,12 +40,12 @@ SETTINGS["log.file"] = True
 CTP_SETTING = {
     # SimNow 登录用户名应填写 6 位 InvestorID，不是网页登录手机号。
     # 可通过环境变量 SIMNOW_USER/SIMNOW_PASSWORD 覆盖，避免把密码写在脚本里。
-    "用户名": os.getenv("SIMNOW_USER", "18811412241"),
-    "密码": os.getenv("SIMNOW_PASSWORD", "!CzhCy1124"),
+    "用户名": "258545",
+    "密码": "!CzhCy1124",
     "经纪商代码": "9999",
     # SimNow CTP 仿真前置。可通过环境变量切换其他前置地址。
-    "交易服务器": os.getenv("SIMNOW_TD_ADDRESS", "182.254.243.31:40001"),
-    "行情服务器": os.getenv("SIMNOW_MD_ADDRESS", "182.254.243.31:40011"),
+    "交易服务器": os.getenv("SIMNOW_TD_ADDRESS", "182.254.243.31:30001"),
+    "行情服务器": os.getenv("SIMNOW_MD_ADDRESS", "182.254.243.31:30011"),
     "产品名称": "simnow_client_test",
     "授权编码": "0000000000000000",
     "柜台环境": os.getenv("SIMNOW_ENVIRONMENT", "实盘"),
@@ -64,6 +66,12 @@ STRATEGY_CONFIG = {
         "slow_window": 20,          # 慢速均线周期
     },
 }
+
+# ============================================================
+# 行情落库配置
+# ============================================================
+RECORD_BAR_DATA = True
+BAR_FLUSH_SIZE = 1
 
 # ============================================================
 # 交易时段定义（国内期货）
@@ -95,7 +103,56 @@ def validate_config() -> bool:
     return True
 
 
-def run(check_connection: bool = False, wait_seconds: int = 25) -> None:
+class RuntimeBarRecorder:
+    """把 run_sim.py 收到的 Tick 合成 1 分钟 K 线并写入数据库。"""
+
+    def __init__(self, vt_symbol: str, database: BaseDatabase) -> None:
+        self.vt_symbol = vt_symbol
+        self.database = database
+        self.buffer: list[BarData] = []
+        self.bar_count = 0
+        self.bg = BarGenerator(self.on_bar)
+
+    def on_tick(self, tick: TickData) -> None:
+        """处理 Tick 数据。"""
+        if tick.vt_symbol != self.vt_symbol:
+            return
+        try:
+            self.bg.update_tick(tick)
+        except Exception:
+            logger.exception("1分钟K线落库处理异常")
+
+    @staticmethod
+    def get_bar_vt_symbol(bar: BarData) -> str:
+        """兼容不同 vn.py 版本的 BarData 交易所字段。"""
+        exchange = getattr(bar.exchange, "value", bar.exchange)
+        return f"{bar.symbol}.{exchange}"
+
+    def on_bar(self, bar: BarData) -> None:
+        """保存合成后的 1 分钟 K 线。"""
+        self.bar_count += 1
+        self.buffer.append(bar)
+
+        if len(self.buffer) >= BAR_FLUSH_SIZE:
+            self.flush()
+
+        logger.info(
+            f"[落库] {self.get_bar_vt_symbol(bar)} | {bar.datetime.strftime('%Y-%m-%d %H:%M')} | "
+            f"O={bar.open_price:.1f} H={bar.high_price:.1f} "
+            f"L={bar.low_price:.1f} C={bar.close_price:.1f} "
+            f"V={bar.volume:.0f} | 累计 {self.bar_count} 根1分钟K线"
+        )
+
+    def flush(self) -> None:
+        """刷入数据库。"""
+        if not self.buffer:
+            return
+
+        self.database.save_bar_data(self.buffer, stream=True)
+        self.buffer.clear()
+
+
+def run(check_connection: bool = False, wait_seconds: int = 25, record_bars: bool = RECORD_BAR_DATA) -> None:
     """启动模拟交易"""
     # 校验配置
     if not validate_config():
@@ -129,12 +186,22 @@ def run(check_connection: bool = False, wait_seconds: int = 25) -> None:
 
     # 5. 连接诊断：监控 Tick 接收情况
     tick_counter = {"count": 0, "last_tick_time": None, "last_tick_symbol": None}
+    bar_recorder: RuntimeBarRecorder | None = None
+
+    if record_bars and not check_connection:
+        database = get_database()
+        bar_recorder = RuntimeBarRecorder(STRATEGY_CONFIG["vt_symbol"], database)
+        logger.info(f"1分钟K线落库已启用: {STRATEGY_CONFIG['vt_symbol']}")
 
     def on_tick_diagnostic(event: Event) -> None:
         tick: TickData = event.data
         tick_counter["count"] += 1
         tick_counter["last_tick_time"] = tick.datetime
         tick_counter["last_tick_symbol"] = tick.vt_symbol
+
+        if bar_recorder:
+            bar_recorder.on_tick(tick)
+
         # 前 5 个 Tick 打印详情，之后每 100 个打印一次
         if tick_counter["count"] <= 5 or tick_counter["count"] % 100 == 0:
             logger.info(
@@ -247,6 +314,10 @@ def run(check_connection: bool = False, wait_seconds: int = 25) -> None:
         logger.info("收到停止信号，正在关闭...")
 
     # 11. 清理退出
+    if bar_recorder:
+        bar_recorder.flush()
+        logger.info(f"1分钟K线落库结束，累计写入 {bar_recorder.bar_count} 根K线")
+
     main_engine.close()
     logger.info("模拟交易系统已安全关闭")
 
@@ -265,9 +336,18 @@ def parse_args() -> argparse.Namespace:
         default=25,
         help="连接后等待合约下载的秒数，默认 25",
     )
+    parser.add_argument(
+        "--no-record",
+        action="store_true",
+        help="运行策略但不把实时 Tick 合成 1分钟K线写入数据库",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(check_connection=args.check_connection, wait_seconds=args.wait)
+    run(
+        check_connection=args.check_connection,
+        wait_seconds=args.wait,
+        record_bars=not args.no_record,
+    )
